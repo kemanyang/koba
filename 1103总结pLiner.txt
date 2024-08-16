@@ -1,0 +1,1128 @@
+# pLiner解决什么问题
+
+## 问题是什么
+
+用c语言编写的浮点运算程序使用-O3和-O3 -ffast-math两种编译选项编译后，某些输入数据，会使运算结果不一致。作者称这种现象为compiler induced inconsistency。作者编写了一个名叫pLIner的程序来从源码中找出导致这种现象的代码。
+
+## -ffast-math选项介绍
+
+-ffast-math是一个群组选项，包括如下选项：
+
+- -fno-honor-nans假定浮点运算中没有NaN（not a number），NaN表示未定义或不可表示的值。
+- -fno-honor-infinities假定浮点运算中没有正负无穷。
+- -fapprox-func是一个群组选项，允许不安全的浮点数优化
+  - -fassociative-math 关联性优化，利用运算符的关联性重新排列操作
+  - -freciprocal-math 允许将除以一个数变成乘以这个数的倒数
+  - -fno-signed-zeros 假定浮点运算中没有“有符号零”
+  - -fno-trapping-math 假定浮点运算中不会出现trap，如除以零、上溢出和下溢出
+  - -ffpcontract=fast 指定何时允许编译器形成融合浮点运算，如融合乘加（FMA）。与单独执行相同的操作相比，允许融合操作产生更精确的结果。
+- -fno-math-errno errno会记录标准函数的错误原因，关闭后可以加速程序
+- -ffinite-math-only 假设浮点运算中不会出现NaNs或+-Inf
+- -fno-rounding-math 使浮点操作使用动态的舍入方式
+
+> [Clang Compiler User’s Manual — Clang 18.0.0git documentation (llvm.org)](https://clang.llvm.org/docs/UsersManual.html)
+
+
+
+## LLVM-IR对比
+
+使用-ffast-math后，IR指令增加了reassoc、nsz、arcp、contract选项，同时数学函数替换为了llvm的intrinsic函数。intrinsic函数是llvm-IR级的函数，用于在特定硬件架构上实现高效的运算。
+
+| 指令类型 | -O3                                        | -O3 -ffast-math -fno-finite-math-only                        |
+| -------- | ------------------------------------------ | ------------------------------------------------------------ |
+| 浮点加   | fadd x86_fp80 %30, %26                     | fadd reassoc nsz arcp contract x86_fp80 %27, %28             |
+| 浮点减   | fsub x86_fp80 %25, %31                     | fsub reassoc nsz arcp contract x86_fp80 %30, %26             |
+| 浮点乘   | fmul x86_fp80 %29, 0xK42C3B945584CAB634000 | fmul reassoc nsz arcp contract x86_fp80 %29, 0xKC2C3B945584CAB634000 |
+| 浮点除   | fdiv x86_fp80 0xK427DCF98D2560AC3D800, %68 | fdiv reassoc nsz arcp x86_fp80 0xK427DCF98D2560AC3D800, %111 |
+| 浮点比较 | %37 = fcmp olt double %36, 0.000000e+00    | fcmp reassoc nsz arcp olt double %36, 0.000000e+00           |
+| 函数调用 | tail call x86_fp80 @sinl(x86_fp80 %33) #2  | tail call reassoc nsz arcp x86_fp80 @llvm.sin.f80(x86_fp80 %33) |
+
+### 获取.ll文件
+
+`clang -S -emit-llvm -O3 -ffast-math factorial.c`
+
+# 如何解决
+
+## 理论
+
+增加某个代码区域中的浮点变量精度后，如果不一致现象消失，则说明该区域代码导致了不一致。
+
+## 精度增强相关算法
+
+### 函数转换（function transformation）
+
+浮点参数、浮点指针参数、浮点数组参数
+
+- 对于浮点参数var_param，`long double var_param_h = var_param`所有使用var_param的地方修改为var_param_h。
+- 对于函数内的局部浮点变量var_local,将其声明修改为`long double var_local;`。
+- 对于浮点指针参数、浮点指针变量、浮点数组参数和浮点数组变量，只在引用的时候进行显式类型转换。这是为了防止内存占用的急剧增加。
+- 没有修改函数签名，这会导致返回值存在精度损失。
+
+
+
+| 变量类型                             | 入口点                              | 引用                       | 出口点 |
+| ------------------------------------ | ----------------------------------- | -------------------------- | ------ |
+| 浮点参数var_param                    | long double var_param_h = var_param | var_param修改为var_param_h |        |
+| 浮点变量var                          | long double var                     |                            |        |
+| 浮点指针变量/参数、浮点数组变量/参数 |                                     | 显式类型转换(long double)  |        |
+
+
+
+### 区域转换（region transformation）
+
+要求所有浮点数使用long double进行运算，并且浮点降级尽可能少。
+
+首先对区域内的变量分类。根据不同的类别进行相应的修改。
+
+- 需要代替声明的变量：写后读且声明在区域外，入口处`long double var_h = var` 出口处`var = var_h` ，将区域内的所有var替换为var_h。
+- 需要修改声明的变量：写后读且声明在区域内，入口处`long double var_h`出口处`double var = var_h`，将区域内所有var替换为var_h。
+- 类型转换的变量：剩余变量直接进行显式类型转换。
+
+| 变量类型                          | 入口点                                   | 引用                         | 出口点                          |
+| --------------------------------- | ---------------------------------------- | ---------------------------- | ------------------------------- |
+| 写后读，且声明在区域外var_outside | long double var_outsied_h = var_outside; | var_outside_h替换var_outside | var_outside = var_outside_h;    |
+| 写后读，且声明在区域内var_inside  | long double var_inside_h;                | var_inside_h替换var_inside   | double var_inside=var_inside_h; |
+| 其他变量                          |                                          | 引用时显式类型转换           |                                 |
+
+问题：在函数部分，需要转换的变量分类为浮点参数/变量、浮点指针和数组参数/变量，但是在区域转换部分，转换的变量分类为了写后读变量和其它变量。
+
+
+
+### 变量分类算法
+
+三个集合revise\replace\typecast来保存三种类别的变量。另外两个集合curr_reads记录读取过的变量，visited记录分类的变量。
+
+# 实现
+
+操纵clang抽象语法树，对源码进行修改。
+
+1. pLiner程序由c++编写，用以增强源码指定区域的浮点变量精度
+2. python程序调用pLiner程序来增强精度，从function、loops、basic blocks和lines四个粒度，采用二分法逐渐缩小转换区域。每次pLiner增强精度后，python脚本调用shell脚本来编译运行代码。
+
+## clang接口
+
+### 接口使用流程
+
+1. 重写`RecursiveASTVisitor类 `，该类控制对AST节点的行为
+
+```c++
+//私有成员
+ASTContxt context；
+//重写构造函数
+explicit funcAnalysisVisitor(ASTContext *Context) : Context(Context) {}
+//重写<VisitFunctionDecl>函数，该函数表示遍历到AST中指定节点时采取的行为
+inline virtual bool funcAnalysisVisitor::VisitFunctionDecl(clang::FunctionDecl *func)
+```
+
+
+
+2. 重写`clang::ASTConsumer `类
+
+```c++
+//私有成员是重写的<RecursiveASTVisitor>类对象
+funcAnalysisVisitor Visitor;
+// 重写构造函数
+explicit funcAnalysisConsumer(ASTContext *Context) : Visitor(Context) {}
+// 重写<HandleTranslationUnit>函数,该函数调用Visitor对象的<TraverseDecl>
+  virtual void HandleTranslationUnit(clang::ASTContext &Context) {
+    Visitor.TraverseDecl(Context.getTranslationUnitDecl());
+  }
+```
+
+3. 重写`clang::ASTFrontendAction`类
+
+```c++
+// 重写<CreateASTConsumer>函数
+// clang::CompilerInstance用于管理clang 编译器的单个实例，1.包含运行编译器的多个对象，如预处理器和ASTContext。2.包含多个例程，这些例程用来构建和操纵clang的常用对象。
+std::unique_ptr<clang::ASTConsumer> funcAnalysisAction::CreateASTConsumer(
+  clang::CompilerInstance &CI, StringRef InFile) {
+  
+  AnRewriter.setSourceMgr(CI.getSourceManager(), CI.getLangOpts());
+  
+  outs() << "** Creating funcAnalysis AST consumer for: " << InFile << "\n";
+  return std::unique_ptr<clang::ASTConsumer>(
+      new funcAnalysisConsumer(&CI.getASTContext()));
+}
+// 重写<EndSourceFileAction>函数
+void funcAnalysisAction::EndSourceFileAction(){
+  SourceManager &SM = AnRewriter.getSourceMgr();
+  outs() << "** End funcAnalysis Action for: "
+               << SM.getFileEntryForID(SM.getMainFileID())->getName() << "\n";
+}
+```
+
+4. 自定义选项，全局
+
+```c++
+static cl::OptionCategory FPDebuggerCat("pLiner Options");
+
+static cl::opt<bool> printOnly("po",cl::desc("flag that specifies whether to print the functions only, false in default"),
+                     cl::init(false), cl::cat(FPDebuggerCat));
+static cl::opt<bool> analysisOnly("ao",cl::desc("flag that specifies whether to perform the analysis only, false in default"),
+                     cl::init(false), cl::cat(FPDebuggerCat));
+static cl::opt<bool> wholetransformation("whole",cl::desc("flag that specifies whether to perform the transformation for the whole function, false in default"),
+                     cl::init(false), cl::cat(FPDebuggerCat));
+
+static cl::opt<string> inRegions("r",cl::desc("a json file that contains the region list for transformation"),
+                     cl::init("pLiner-input.json"), cl::cat(FPDebuggerCat));
+static cl::opt<string> outFileName("o",cl::desc("name of the transformed file"),
+                     cl::init("output.txt"), cl::cat(FPDebuggerCat));
+static cl::opt<string> myReal("h",cl::desc("high precision"),
+                     cl::init("long double"), cl::cat(FPDebuggerCat));
+```
+
+5. 运行
+
+```c++
+// Parse the command-line args passed to the code
+CommonOptionsParser op(argc, argv, FPDebuggerCat, nullptr);
+
+// Create a new Clang Tool instance 
+ClangTool Tool(op.getCompilations(), op.getSourcePathList());
+
+// 运行自定义前端行为
+result = Tool.run(newFrontendActionFactory<funcAnalysisAction>().get());
+```
+
+
+
+### 完整示例
+
+```c++
+//RecursiveASTVisitor 定义对AST树中节点的行为
+class funcAnalysisVisitor : public RecursiveASTVisitor<funcAnalysisVisitor> {
+public:
+  explicit funcAnalysisVisitor(ASTContext *Context) : Context(Context) {}
+
+  virtual bool VisitFunctionDecl(FunctionDecl *func) {
+    if (!func->doesThisDeclarationHaveABody())
+	return true;
+    string funcName = func->getNameInfo().getName().getAsString();
+
+    if (pfuncs.find(funcName)!=pfuncs.end()) {
+      numAFunctions++;
+      outs() << "\n** function " << numAFunctions << " : " << funcName << "\n";
+
+      _funcRecord frecord(func, Context);
+
+      frecord.processFPParameters();//lx:收集函数的浮点参数和浮点参数指针
+      frecord.processBBs();//lx:收集基本块的块号和对应的首尾行号
+      frecord.processLoops();//lx：收集for循环首尾行号
+      frecord.processLines();//lx：收集行号和对应的LineRecord对象
+ 
+      //outs() << "** function " << numAFunctions << " : " << funcName << "\n";
+      frecord.printFuncRecord(prof_prefix+'-'+funcName);
+    }       
+    return true;     
+  }   
+ 
+private:
+  ASTContext *Context;
+};
+//分析命令选项
+CommonOptionsParser op(argc, argv, FPDebuggerCat, nullptr);
+//创建Tool对象并运行自定义前端行为
+ClangTool Tool(op.getCompilations(), op.getSourcePathList());
+result = Tool.run(newFrontendActionFactory<funcPrintAction>().get());
+
+//创建自定义前端行为funcAnalysisAction
+Rewriter AnRewriter;//用来修改源码的对象
+class funcAnalysisAction : public clang::ASTFrontendAction {
+public:
+  virtual std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(
+    clang::CompilerInstance &CI, StringRef InFile);
+  void EndSourceFileAction();
+};
+std::unique_ptr<clang::ASTConsumer> funcAnalysisAction::CreateASTConsumer(
+  clang::CompilerInstance &CI, StringRef InFile) {
+  
+  AnRewriter.setSourceMgr(CI.getSourceManager(), CI.getLangOpts());
+  
+  outs() << "** Creating funcAnalysis AST consumer for: " << InFile << "\n";
+  return std::unique_ptr<clang::ASTConsumer>(
+      new funcAnalysisConsumer(&CI.getASTContext()));
+}
+
+void funcAnalysisAction::EndSourceFileAction(){
+  SourceManager &SM = AnRewriter.getSourceMgr();
+  outs() << "** End funcAnalysis Action for: "
+               << SM.getFileEntryForID(SM.getMainFileID())->getName() << "\n";
+}
+
+//ASTConsumer
+class funcAnalysisConsumer : public clang::ASTConsumer {
+public:
+  explicit funcAnalysisConsumer(ASTContext *Context) : Visitor(Context) {}
+
+  virtual void HandleTranslationUnit(clang::ASTContext &Context) {
+    Visitor.TraverseDecl(Context.getTranslationUnitDecl());
+  }
+private:
+  funcAnalysisVisitor Visitor;
+};
+
+
+```
+
+## 操纵clang AST
+
+### AST概览
+
+<img src="1103总结pLiner.assets\AST概览(2).png"  width="500"  height = "400"> 
+
+### 输出clang AST
+
+clang -fsyntax-only -Xclang -ast-dump test.cpp `
+
+### ASTContext
+
+#### 获取函数声明所在的文件名称
+
+```
+FunctionDecl *func
+fileName = context->getSourceManager().getFilename(func->getLocation()).str();
+```
+
+#### 位置比较、获取行号
+
+##### 获取函数开始位置
+
+```
+escope = funcDel->getSourceRange().getBegin();
+lineNum = context->getFullLoc(escope).getSpellingLineNumber();
+
+columnNum = context->getFullLoc(escope).getSpellingColumnNumber();
+```
+
+##### 获取函数末尾位置
+
+```c++
+escope = funcDel->getSourceRange().getEnd();
+context->getFullLoc(escope).getSpellingLineNumber();
+
+```
+
+##### 获取基本块中语句位置
+
+```c++
+const Stmt * front = block->front().getAs<CFGStmt>()->getStmt();
+const Stmt * back = block->back().getAs<CFGStmt>()->getStmt();
+SourceLocation fSL = front->getSourceRange().getBegin();
+SourceLocation bSL = back->getSourceRange().getEnd();
+unsigned frontLine = context->getFullLoc(fSL).getSpellingLineNumber();
+unsigned backLine = context->getFullLoc(bSL).getSpellingLineNumber();
+
+SourceLocation SL = statement->getSourceRange().getBegin();
+unsigned line = context->getFullLoc(SL).getSpellingLineNumber();
+```
+
+##### 范围比较:SourceLocation,SourceRange
+
+```c++
+// 位置介于没某段代码之间
+const clang::Stmt *statement;
+SourceRange range = statement->getSourceRange();
+SourceLocation loc = svar->getExprLoc();
+if (loc<range.getBegin()||range.getEnd()<loc)
+      continue;
+
+```
+
+
+
+### 修改源码：Rewriter
+
+#### 在函数声明上一行写入
+
+```
+SourceLocation SL = func->getBeginLoc();
+std::stringstream myText;
+myText << "// this is my insert \n";
+pRewriter.InsertText(SL.getLocWithOffset(0), myText.str(), false, true);
+```
+
+
+
+#### 在语句前写入内容
+
+```c++
+//在复合语句的第一条语句前写入内容，getLocWithOffset表示相对当前行n行的位置
+const CompoundStmt *fBody = dyn_cast<CompoundStmt>(funcDel->getBody());
+  CompoundStmt::const_body_iterator stmtI = fBody->body_begin();
+  SourceLocation SL = (*stmtI)->getSourceRange().getBegin();
+TheRewriter.InsertText(SL.getLocWithOffset(0), fparaH.str()+regEntry.str(), false, true);
+```
+
+#### 在语句前写入
+
+```c++
+// 可能是在语句前写入？
+Stmt *stmtI;
+SourceRange range = stmtI->getSourceRange();
+TheRewriter.InsertTextBefore(range.getBegin(), synEntry.str());
+```
+
+#### 在变量名前增加强制类型转换
+
+```c++
+// 在引用的变量名字前增加强制类型转换
+DeclRefExpr* readV；
+TheRewriter.InsertText(readV->getExprLoc(), "("+typeTransTo+")", false, false);
+```
+
+#### 修改引用的变量名
+
+```c++
+// 修改引用的变量名称
+TheRewriter.ReplaceText(readV->getExprLoc(), vname.length(), newvname);
+```
+
+#### 修改调用表达式中的函数名称
+
+```c++
+// 修改调用表达式中的函数名称
+const clang::CallExpr *callop；
+TheRewriter.ReplaceText(callop->getExprLoc(), cname.length(), cname_ld);
+```
+
+#### 修改声明类型
+
+```c++
+// int a ---------> double a
+string typeName = "int";
+string newtype = "doublw";
+const clang::VarDecl *wd
+TheRewriter.ReplaceText(wd->getSourceRange().getBegin(), typeName.length(), newtype);
+```
+
+#### 修改声明的变量名
+
+```c++
+// int a ---------->int b
+string ws = "a";
+string wsH = "b";
+const clang::VarDecl *wd
+TheRewriter.ReplaceText(wd->getLocation(), ws.length(), wsH);
+```
+
+#### 将修改写入文件
+
+```c++
+// Now emit the rewritten buffer.
+  std::error_code error_code;
+  llvm::raw_fd_ostream outFile(outfilename, error_code, llvm::sys::fs::F_None);
+  TRewriter.getEditBuffer(SM.getMainFileID()).write(outFile); 
+  outFile.close();
+```
+
+
+
+### 源码管理：SourceManager
+
+#### 获取函数所在文件名
+
+```c++
+Rewriter TRewriter;
+AnRewriter.setSourceMgr(CI.getSourceManager(), CI.getLangOpts());
+
+SourceManager &SM = AnRewriter.getSourceMgr();
+SM.getFileEntryForID(SM.getMainFileID())->getName()
+```
+
+### 表达式：Expr
+
+#### 表达式：Expr
+
+##### 获取表达式行号
+
+```c++
+const clang::Expr* epr;
+SourceLocation SL = epr->getExprLoc();
+unsigned line = context->getFullLoc(SL).getSpellingLineNumber();
+```
+
+##### 转换为其他表达式类型
+
+```c++
+auto arr = dyn_cast<ArraySubscriptExpr>(epr)
+
+readV = dyn_cast<DeclRefExpr>(epr)
+
+auto bop = dyn_cast<BinaryOperator>(epr)
+
+auto cop = dyn_cast<ConditionalOperator>(epr)
+
+auto uop = dyn_cast<UnaryOperator>(epr)
+
+auto callop = dyn_cast<CallExpr>(epr)
+```
+
+##### 判断表达式类型
+
+```c++
+if ( string(epr->getStmtClassName()) == "IntegerLiteral" || string(epr->getStmtClassName()) == "FloatingLiteral"){
+    ;
+}
+```
+
+
+
+#### 数组下标表达式：ArraySubscriptExpr 
+
+##### 获得数组名称
+
+```
+ArraySubscriptExpr* arr;
+const clang::Expr *epr;
+epr = arr->getBase()->IgnoreParenImpCasts();
+```
+
+#### 声明引用表达式：DeclRefExpr
+
+##### 获得引用变量的类型
+
+```
+DeclRefExpr* readV；
+const clang::Type* ty= readV->getDecl()->getType().getTypePtr();
+```
+
+##### 由声明引用获得变量声明
+
+```c++
+DeclRefExpr* readV；
+const VarDecl* vdel = dyn_cast<VarDecl>(readV->getDecl());
+```
+
+##### 获得引用变量的变量名
+
+```c++
+DeclRefExpr* readV；
+string vname = readV->getNameInfo().getAsString();
+```
+
+#### 二元操作符： BinaryOperator 
+
+##### 获取子表达式
+
+```c++
+const clang::BinaryOperator *bop；
+bop->getLHS()->IgnoreParenImpCasts()；
+bop->getRHS()->IgnoreParenImpCasts()；
+```
+
+#### 条件操作符：ConditionalOperator 
+
+##### 获取子表达式
+
+```c++
+const clang::ConditionalOperator *cop；
+cop->getCond()->IgnoreParenImpCasts()；// 条件表达式
+cop->getTrueExpr()->IgnoreParenImpCasts()；// true表达式
+cop->getFalseExpr()->IgnoreParenImpCasts()；// false表达式
+```
+
+#### 一元操作符：UnaryOperator 
+
+#####获取操作符名字
+
+```c++
+StringRef opcode=uop->getOpcodeStr(uop->getOpcode());
+```
+
+#####获取子表达式
+
+```c++
+UnaryOperator *uop；
+clang::Expr* uopr = uop->getSubExpr()->IgnoreParenImpCasts();
+```
+
+#### 调用表达式：CallExpr 
+
+##### 获取被调用函数的函数名 
+
+```c++
+const clang::CallExpr *callop；
+auto callee = dyn_cast<const clang::NamedDecl>(callop->getCalleeDecl())
+const string cname = callee->getNameAsString(); 
+```
+
+##### 遍历被调用函数参数
+
+```c++
+for (const auto * epr : callop->arguments()) //const clang::Expr *epr
+        if (!isa<CXXDefaultArgExpr>(epr))
+          wlist.push_back(epr->IgnoreParenImpCasts());
+    } else if ( string(epr->getStmtClassName()) == "IntegerLiteral" || string(epr->getStmtClassName()) == "FloatingLiteral"){
+		;
+    }  
+}
+```
+
+### 声明：Decl
+
+#### 变量声明：VarDecl
+
+##### 获得变量的类型
+
+```c++
+// 比如“int”
+const clang::Type* ty= sd->getType().getTypePtr();
+```
+
+##### 获得声明修饰符
+
+```c++
+// 比如“const”
+string qualifiers = wd->getType().getQualifiers().getAsString();
+```
+
+##### 获得变量名
+
+```c++
+VarDecl *dvar；
+string ds = dvar->getNameAsString()
+```
+
+##### 判断是不是参数变量声明
+
+```c++
+if(const ParmVarDecl* pd=dyn_cast<ParmVarDecl>(wd))；
+```
+
+##### 判断是否有初始值
+
+```c++
+VarDecl *dvar；
+bool a = dvar->hasInit()；
+```
+
+#### 函数声明：FuncDecl
+
+##### 获得函数体CompoundStmt并遍历
+
+```c++
+FunctionDecl *funcDel;
+const CompoundStmt *fBody = dyn_cast<CompoundStmt>(funcDel->getBody());
+for (stmtI =fBody->body_begin(); stmtI != fBody->body_end(); stmtI++){
+    const Stmt * st = *stmtI;
+    processForLoops(st);
+  }
+```
+
+##### 获得函数名称
+
+```c++
+FunctionDecl *func;
+funcName = func->getNameInfo().getName().getAsString();
+```
+
+#####遍历获取参数变量类型
+
+```c++
+if (funcDel->param_begin())
+    for (const auto * parameter : funcDel->parameters()){
+      const clang::Type* ty = parameter->getOriginalType().getTypePtr();
+    }
+```
+
+#####获取参数变量声明的名字
+
+```c++
+const clang::ParmVarDecl * parameter;
+string pname = parameter->getNameAsString();
+```
+
+##### 获取参数变量声明的修饰符名字
+
+`string pqualifiers = parameter->getOriginalType().getQualifiers().getAsString();`
+
+### 语句：Stmt
+
+#### 语句：Stmt
+
+##### 获取语句类型
+
+```c++
+// 语句类型有：CompoundStmt、DeclStmt、BinaryOperator、CompoundAssignOperator、IfStmt、SwitchStmt、ForStmt、WhileStmt、CallExpr、ReturnStmt
+
+const Stmt* statement;
+string type = statement->getStmtClassName();
+```
+
+##### 获取语句位置行号
+
+```c
+const Stmt* statement；
+SourceLocation SL = statement->getSourceRange().getBegin();
+unsigned line = context->getFullLoc(SL).getSpellingLineNumber();
+```
+
+
+
+##### 转换语句类型
+
+```c++
+//Stmt类型转换为ReturnStmt类型
+Stmt* statement;
+auto rs = dyn_cast<const ReturnStmt>(statement);
+
+auto ws = dyn_cast<WhileStmt>(statement);
+
+auto fs = dyn_cast<const ForStmt>(statement);
+
+auto is = dyn_cast<const IfStmt>(statement);
+
+auto ss = dyn_cast<const SwitchStmt>(statement);
+
+auto ds = dyn_cast<const DeclStmt>(statement);
+
+auto bs = dyn_cast<BinaryOperator>(statement);
+
+auto comas = dyn_cast<CompoundAssignOperator>(statement);
+
+auto cs = dyn_cast<const CompoundStmt>(statement);
+
+auto callep = dyn_cast<CallExpr>(statement);
+```
+
+
+
+#### 声明语句：DeclStmt
+
+##### 遍历VarDecl
+
+```
+for(const auto * vdI = delst->decl_begin(); vdI != delst->decl_end(); vdI++){
+    const VarDecl *vd = dyn_cast<VarDecl>(*vdI);
+```
+
+
+
+
+
+#### 复合语句：CompoundStmt
+
+```c++
+// 在函数第一条语句前写入内容。
+// 函数声明----函数体---------第一条语句------第一条语句位置------
+const CompoundStmt *fBody = dyn_cast<CompoundStmt>(funcDel->getBody());
+  CompoundStmt::const_body_iterator stmtI = fBody->body_begin();
+  SourceLocation SL = (*stmtI)->getSourceRange().getBegin();
+TheRewriter.InsertText(SL.getLocWithOffset(0), fparaH.str()+regEntry.str(), false, true);
+```
+
+##### 遍历复合语句
+
+```c++
+//遍历复合语句
+onst CompoundStmt *fBody = dyn_cast<CompoundStmt>(funcDel->getBody());
+for (stmtI =fBody->body_begin(); stmtI != fBody->body_end(); stmtI++){
+    const Stmt * st = *stmtI;
+    transWholeStmts(TheRewriter, st);
+    }
+```
+
+
+
+#### 返回语句：ReturnStmt
+
+```
+// 获得返回的表达式
+const clang::Expr* epr = rst->getRetValue()->IgnoreParenImpCasts();
+
+// 
+```
+
+### 类型：Type
+
+#### 类型判断及转换
+
+```c++
+const Type* ty;
+if (ty->isPointerType()){
+    const clang::Type* pty = ty->getPointeeType().getTypePtr(); 
+    if(pty->isFloatingType() & (context->getTypeSize(pty)==64)) 
+      return true;
+  }
+```
+
+### 函数所在文件判断
+
+```c++
+FunctionDecl *func;
+Rewriter pRewriter；
+SourceManager &SM = pRewriter.getSourceMgr();
+string fileInProcess = SM.getFileEntryForID(SM.getMainFileID())->getName();
+string funcFile = Context->getSourceManager().getFilename(func->getLocation()).str();
+if (funcFile != fileInProcess)
+	return true;
+```
+
+### 创建并遍历基本块
+
+```c++
+// create CFG
+  std::unique_ptr<CFG> sourceCFG = CFG::buildCFG(funcDel, funcDel->getBody(), context, CFG::BuildOptions());
+  //sourceCFG->print(llvm::errs(), LangOptions(), true);
+  
+  // traverse through CFG blocks
+  CFG::const_iterator CFGBI;
+  for (CFGBI = sourceCFG->begin(); CFGBI != sourceCFG->end(); CFGBI++){
+    CFGBlock* block = *CFGBI;
+    if (block->empty())
+      continue;
+		
+    const Stmt * front = block->front().getAs<CFGStmt>()->getStmt();
+    const Stmt * back = block->back().getAs<CFGStmt>()->getStmt();
+    SourceLocation fSL = front->getSourceRange().getBegin();
+    SourceLocation bSL = back->getSourceRange().getEnd();
+    unsigned frontLine = context->getFullLoc(fSL).getSpellingLineNumber();
+    unsigned backLine = context->getFullLoc(bSL).getSpellingLineNumber();
+    
+    if(isa<BinaryOperator>(back)){
+      const Stmt * extra = back;
+      SourceLocation efSL = extra->getSourceRange().getBegin();
+      SourceLocation ebSL = extra->getSourceRange().getEnd();
+      unsigned efrontLine = context->getFullLoc(efSL).getSpellingLineNumber();
+      unsigned ebackLine = context->getFullLoc(ebSL).getSpellingLineNumber();
+      bblist[block->getBlockID()+10000] = std::make_tuple(efrontLine, ebackLine);
+
+      if (block->end() - block->begin() > 1){
+        back = (*(block->end()-2)).getAs<CFGStmt>()->getStmt();
+        bSL = back->getSourceRange().getEnd();
+        backLine = context->getFullLoc(bSL).getSpellingLineNumber();
+
+        bblist[block->getBlockID()] = std::make_tuple(frontLine, backLine);
+      }
+    } else {
+      bblist[block->getBlockID()] = std::make_tuple(frontLine, backLine);
+    }
+    //llvm::errs() << "block back stmt on line " << backLine << ":\n";
+    //back->dump();
+  }  
+```
+
+### 添加命令行选项
+
+```c++
+
+// 全局
+static cl::OptionCategory FPDebuggerCat("pLiner Options");
+static cl::opt<bool> printOnly("po",cl::desc("flag that specifies whether to print the functions only, false in default"),
+                     cl::init(false), cl::cat(FPDebuggerCat));
+static cl::opt<bool> analysisOnly("ao",cl::desc("flag that specifies whether to perform the analysis only, false in default"),
+                     cl::init(false), cl::cat(FPDebuggerCat));
+static cl::opt<bool> wholetransformation("whole",cl::desc("flag that specifies whether to perform the transformation for the whole function, false in default"),
+                     cl::init(false), cl::cat(FPDebuggerCat));
+
+static cl::opt<string> inRegions("r",cl::desc("a json file that contains the region list for transformation"),
+                     cl::init("pLiner-input.json"), cl::cat(FPDebuggerCat));
+static cl::opt<string> outFileName("o",cl::desc("name of the transformed file"),
+                     cl::init("output.txt"), cl::cat(FPDebuggerCat));
+static cl::opt<string> myReal("h",cl::desc("high precision"),
+                     cl::init("long double"), cl::cat(FPDebuggerCat));
+                     
+// main函数内
+CommonOptionsParser op(argc, argv, FPDebuggerCat, nullptr);
+```
+
+## 文件操作
+
+### json操作
+
+#### json写入文件
+
+```c++
+json j;
+json j_vec(funclist); 
+j["pLiner-funcs"] = j_vec;
+std::ofstream o("func-list.json");
+o << std::setw(4) << j << std::endl;
+
+```
+
+#### 文件读取到json
+
+```c++
+//文件内容读取到json对象
+std::ifstream file;
+file.open(inRegions);
+json j = json::parse(file);
+file.close();
+```
+
+#### std:stringstream操作
+
+```c++
+std:stringstream regEntry;
+regEntry.str("");
+
+regEntry << newtype << " " << wsH << " = " << ws << ";\n";
+```
+
+## 打印操作
+
+### 标准输出
+
+`outs() << "\n** function " << numAFunctions << " : " << funcName << "\n";`
+
+### 标准错误输出
+
+`llvm::errs() << "call expr (line " << line << " ): " << callee->getNameAsString() << "\n";`
+
+## pLIner实现思路
+
+![](1103总结pLiner.assets/pLiner实现思路-1699793699526.png)
+
+
+
+## AST参考博客
+
+> [三，Clang AST 基础学习_declrefexpr是什么-CSDN博客](https://blog.csdn.net/hatter110/article/details/107282596) 
+
+
+
+# pliner使用
+
+`python2 ../../../scripts/search.py ${file}.c "--" 1`
+
+1表示输出信息，缺省为0
+
+”--“后面加附加的编译选项
+
+
+
+```
+指定pliner转换的区域
+clangdir=`clang -print-resource-dir`
+compflags="-I $clangdir/include"
+pLiner $test.c -r $test.json -o ${test}_trans.c  -- $compflags
+
+转换所有函数
+获得func-list.json
+pLiner $test.c --po -- $compflags 
+
+pLiner $test.c -r func-list.json --whole -o ${test}_wholetrans.c &>/dev/null -- $compflags
+```
+
+关于NPB的编译命令
+
+```
+在主目录下
+make SP  CLASS=A
+ cd SP; $(MAKE) CLASS=$(CLASS)
+```
+
+docker相关命令
+
+```
+docker pull ucdavisplse/llnl_pliner:latest
+
+docker run -it ucdavisplse/llnl_pliner:latest /bin/bash
+
+复制docker内的pliner文件夹到主机
+docker cp 30e5a8fe3a5c:/root/pLiner ~/download/pLiner-docker
+```
+
+安装llvm9.0.0
+
+```
+cmake -G "Unix Makefiles" -DLLVM_TARGETS_TO_BUILD=X86 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/home/lx/local -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_C_COMPILER=/usr/bin/gcc -DLLVM_ENABLE_PROJECTS="clang"  ..
+
+/home/lx/local/precimonious/gcc-7.5.0/lib64/libstdc++.so.6
+ /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30
+
+-DCMAKE_CXX_STANDARD=98
+```
+
+
+
+ldd链接的库不一样
+
+![1702537411114](1103总结pLiner.assets/1702537411114.png)
+
+
+
+![1702537417400](1103总结pLiner.assets/1702537417400.png)
+
+ubuntu22上多了libcurses.so.6、libform.so.6，少了libpthread.so.0、
+
+
+
+# Varity和NPB运行结果
+
+## Varity
+
+总计50个程序，成功37个，失败13个。
+
+其中opt0表示`-O0`，opt3表示`-O3 -ffast-math`，opt3_1表示`-O3`。
+
+以下是具体错误类型。
+
+### clang和gcc的计算结果不同
+
+test_10
+
+```
+##################source code##################
+result of clang compile :
+test_10_opt0.exe :      6.8309828963613816e-307
+test_10_opt3.exe :      1.1138598243424943e-306
+test_10_opt3_1.exe :    6.8309828963613816e-307
+result of gcc compile :
+test_10_opt3_gcc.exe :          6.8309828963613816e-307
+test_10_opt3_gcc.exe :          1.1138598243424943e-306
+test_10_opt3_1_gcc.exe :        6.8309828963613816e-307
+##################transformation code##################3
+test_10_trans_opt0.exe :        7.5970382151516768e-307
+test_10_trans_opt3.exe :        7.5970382151516768e-307
+test_10_trans_opt3_1.exe :      7.5970382151516768e-307
+################# gcc transformation ########################
+test_10_trans_opt3_gcc.exe :    7.5970382151516768e-307
+test_10_trans_opt3_gcc.exe :    7.5970382151516768e-307
+test_10_trans_opt3_1_gcc.exe :  7.5970382151516768e-307
+
+```
+
+test_37
+
+```
+##################source code##################
+result of clang compile :
+test_37_opt0.exe :      1.8002999999992524e-312
+test_37_opt3.exe :      0
+test_37_opt3_1.exe :    1.8002999999992524e-312
+result of gcc compile :
+test_37_opt3_gcc.exe :          1.8002999999992524e-312
+test_37_opt3_gcc.exe :          -1.1399e+124
+test_37_opt3_1_gcc.exe :        1.8002999999992524e-312
+##################transformation code##################3
+test_37_trans_opt0.exe :        1.8002999999992524e-312
+test_37_trans_opt3.exe :        1.8002999999992524e-312
+test_37_trans_opt3_1.exe :      1.8002999999992524e-312
+################# gcc transformation ########################
+test_37_trans_opt3_gcc.exe :    1.8002999999992524e-312
+test_37_trans_opt3_gcc.exe :    1.8002999999992524e-312
+test_37_trans_opt3_1_gcc.exe :  1.8002999999992524e-312
+```
+
+
+
+### pLIner无法完成转换
+
+test_11 test_12
+
+### 只有gcc出现结果不一致现象
+
+test_14
+
+```
+##################source code##################
+result of clang compile :
+test_14_opt0.exe :      1.3332999998288693e-314
+test_14_opt3.exe :      1.3332999998288693e-314
+test_14_opt3_1.exe :    1.3332999998288693e-314
+result of gcc compile :
+test_14_opt3_gcc.exe :          1.3332999998288693e-314
+test_14_opt3_gcc.exe :          1
+test_14_opt3_1_gcc.exe :        1.3332999998288693e-314
+##################transformation code##################3
+test_14_trans_opt0.exe :        1.3332999998288693e-314
+test_14_trans_opt3.exe :        1.3332999998288693e-314
+test_14_trans_opt3_1.exe :      1.3332999998288693e-314
+################# gcc transformation ########################
+test_14_trans_opt3_gcc.exe :    1.3332999998288693e-314
+test_14_trans_opt3_gcc.exe :    1.3332999998288693e-314
+test_14_trans_opt3_1_gcc.exe :  1.3332999998288693e-314
+```
+
+### clang和gcc在-O3 -ffast-math下计算结果不同，且clang没能消除不一致现象。
+
+test_16 
+
+```
+##################source code##################
+result of clang compile :
+test_16_opt0.exe :      1.7071999999999999e+208
+test_16_opt3.exe :      -0
+test_16_opt3_1.exe :    1.7071999999999999e+208
+result of gcc compile :
+test_16_opt3_gcc.exe :          1.7071999999999999e+208
+test_16_opt3_gcc.exe :          -1.8508999968058596e-316
+test_16_opt3_1_gcc.exe :        1.7071999999999999e+208
+##################transformation code##################3
+test_16_trans_opt0.exe :        1.7071999999999999e+208
+test_16_trans_opt3.exe :        -0
+test_16_trans_opt3_1.exe :      1.7071999999999999e+208
+################# gcc transformation ########################
+test_16_trans_opt3_gcc.exe :    1.7071999999999999e+208
+test_16_trans_opt3_gcc.exe :    1.7071999999999999e+208
+test_16_trans_opt3_1_gcc.exe :  1.7071999999999999e+208
+```
+
+### clang没出现不一致现象
+
+test_17
+
+```
+##################source code##################
+result of clang compile :
+test_17_opt0.exe :      5.674000000000013e+304
+test_17_opt3.exe :      5.674000000000013e+304
+test_17_opt3_1.exe :    5.674000000000013e+304
+result of gcc compile :
+test_17_opt3_gcc.exe :          5.674000000000013e+304
+test_17_opt3_gcc.exe :          5.6740000000000052e+304
+test_17_opt3_1_gcc.exe :        5.674000000000013e+304
+##################transformation code##################3
+test_17_trans_opt0.exe :        5.6740000000000052e+304
+test_17_trans_opt3.exe :        5.6740000000000052e+304
+test_17_trans_opt3_1.exe :      5.6740000000000052e+304
+################# gcc transformation ########################
+test_17_trans_opt3_gcc.exe :    5.6740000000000052e+304
+test_17_trans_opt3_gcc.exe :    5.6740000000000052e+304
+test_17_trans_opt3_1_gcc.exe :  5.6740000000000052e+304
+```
+
+### clang和gcc在`-O3 -ffast-math`下结果不同，转换后结果相同
+
+test_27
+
+```
+##################source code##################
+result of clang compile :
+test_27_opt0.exe :      -5.641917588155792e-26
+test_27_opt3.exe :      1.5370000000000001e-306
+test_27_opt3_1.exe :    -5.641917588155792e-26
+result of gcc compile :
+test_27_opt3_gcc.exe :          -5.641917588155792e-26
+test_27_opt3_gcc.exe :          -5.6419175881557931e-26
+test_27_opt3_1_gcc.exe :        -5.641917588155792e-26
+##################transformation code##################3
+test_27_trans_opt0.exe :        -5.641917588155792e-26
+test_27_trans_opt3.exe :        -5.641917588155792e-26
+test_27_trans_opt3_1.exe :      -5.641917588155792e-26
+################# gcc transformation ########################
+test_27_trans_opt3_gcc.exe :    -5.641917588155792e-26
+test_27_trans_opt3_gcc.exe :    -5.641917588155792e-26
+test_27_trans_opt3_1_gcc.exe :  -5.641917588155792e-26
+```
+
+### 代码转换出错
+
+test_30
+
+```
+comp = comp = comp_18_18_H;
+```
+
+test_32、test_46、test_47
+
+```
+clang-9: error: no such file or directory: 'test_32_trans.c'
+```
+
+## NPB
+
+测试了三个npb程序，分别是cg.b、sp.b和sp.a，只有sp.b成功。
+
