@@ -1,0 +1,134 @@
+su -  用户名  切换用户
+exit  退出当前用户
+
+ls -alh 显示文件夹和文件名称信息
+
+cd 进入文件夹
+
+mkdir 当前路径下创建文件夹
+mkdir -p 创建长路径文件夹
+
+touch 创建新文件
+
+cat 打开文件
+
+more 打开文件（阅读版）
+
+cp  a.txt b.txt  复制文件a成b
+cp -r  复制文件夹
+
+mv  a  b   移动文件夹  （若为当前文件夹 则为改名效果）
+
+rm -r    删除文件
+rm -f    强制删除
+rm a*  删除以a开头的文件  *a*删除含a的文件  *a删除a结尾额文件
+
+find   起始路径  -name “文件名”  根据名字搜索文件
+find   起始路径  -size   - || + (K.M,G)  根据大小搜索文件
+
+grep  [-n]  "关键字"  文件路径     （-n可选，用来显示该数据的行数）输出该文件内包含关键字的信息
+
+echo：
+	1. 输出字符串：
+	echo "Hello world"
+	2. 输出变量值：
+	name="Linux"
+	echo "The operating system is $name"
+	3. 向文件写入文本：
+	echo "This is a test" > test.txt    （>覆写）  （>>追加）
+	4. 输出多行文本：
+	echo -e "line1\nline2\nline3"
+ 	如果需要将命令的执行结果作为字符串输出，在命令前面加上“$”符号即可，如：
+	echo "The date is $(date)"
+
+tail  [-f]  [-num]   路径        查看文件尾部内容，f持续跟踪   
+
+
+vim   沉浸式文本编写
+u：撤回
+ctrl+r：前撤
+:wq 保存
+esc 退出当前模式
+/ 进入搜索模式
+
+
+chmod:修改文件权限\
+chmod  u=rwx,g=rx,o=x  hello.text  //u表示user ，g为group, o为other    r：read   w：write   x：可执行
+chmod -R u=rwx,g=rx,o=x  test    test文件夹内文件全部执行权限修改操作
+
+
+chown：修改文件所属用户或用户组（普通用户无法执行，一般为root用户执行）
+chown koba : koba_group  test    将test文件夹的所属用户改为koba  所属用户组改为koba_group
+chown -R   koba : koba_group  test   将test文件夹内所有文件同上操作
+
+
+快捷键:
+ctrl+c 强制退出
+ctrl+d 退出登录
+history 查看历史命令
+ctral+r 通过关键字检索历史命令
+ctrl+l 清空屏幕
+
+
+yum -y  install 下载链接     //下载文件 无需确认
+yum remove                     //卸载文件
+
+systemctl  [start][stop][status][enable][disable]    服务名称
+	启动   关闭   状态   开机自启  开机禁用
+
+
+ln -s  要创建快捷方式的文件路径   存放快捷方式的地址          //创建快捷方式
+
+hostnamectl set-hostname ***   改主机名
+
+ping  baidu.com   检测与目标域名是否联通
+
+wget -b  下载链接   //网页下载   -b后台下载
+wget -log    //查看下载列表
+
+nmap  ip地址     查看该主机的端口信息
+
+netstat   查看端口占用信息
+
+ps -ef   任务管理器
+
+kill -9  端口号    关闭进程  -9强制
+
+top 查看cpu情况
+
+df -h  查看磁盘空间情况
+
+env  环境变量
+
+sudo vim /etc/profile   进入该文件加入环境变量全局配置
+source /etc/profile      source一下
+
+tar -czvf file.tar.gz file   压缩
+tar -zxf  解压
+
+蓝色	目录
+白色	一般性文件
+浅蓝色	链接
+绿色	可执行文件
+红色	压缩文件
+黄色	设备文件
+灰色	其他文件
+红色闪烁	链接的文件有问题
+
+
+echo ../example* | xargs -n 1 cp -v run.sh 将run.sh 批量复制到example开头的文件夹中 
+
+variable=`echo `./a/b*` `   # 通配符用匹配用``包起来
+echo $variable                    # 打印变量的值
+
+
+
+
+
+（shell脚本里使用）
+
+read -p "请输入的值：" num
+unset num  清除变量num
+
+export num=$num:10  在已有num后追加值10
+export num=10:$num  在已有num前追加值10
